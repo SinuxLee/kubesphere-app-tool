@@ -1,33 +1,24 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"net/http"
 	"os"
 	"time"
 
+	"github.com/go-resty/resty/v2"
 	"github.com/phuslu/log"
 	"github.com/spf13/cobra"
+	"helm.sh/helm/v3/pkg/cli"
+	"helm.sh/helm/v3/pkg/getter"
+	"helm.sh/helm/v3/pkg/repo"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
-	"sigs.k8s.io/yaml"
 )
-
-type HelmIndex struct {
-	Entries map[string][]struct {
-		Name    string   `json:"name"`
-		Version string   `json:"version"`
-		URLs    []string `json:"urls"`
-	} `json:"entries"`
-}
 
 type AppRequest struct {
 	RepoName     string `json:"repoName"`
@@ -53,6 +44,7 @@ var (
 	serverURL     string
 	token         string
 	repoURL       string
+	limit         int // limit version for each chart
 )
 
 func init() {
@@ -68,6 +60,10 @@ func init() {
 }
 
 func main() {
+	resty_client := resty.New().SetHeader("Content-Type", "application/json").
+		SetHeader("Authorization", fmt.Sprintf("Bearer %s", token)).
+		SetTimeout(time.Second * 5)
+
 	var rootCmd = &cobra.Command{
 		Use:   "app-tool",
 		Short: "A CLI tool to manage applications",
@@ -81,13 +77,14 @@ func main() {
 				}
 				token = string(data)
 			}
-			run()
+			run(resty_client)
 		},
 	}
 
 	rootCmd.Flags().StringVar(&serverURL, "server", "", "Kubesphere Server URL (required)")
 	rootCmd.Flags().StringVar(&repoURL, "repo", "", "Helm index URL (required)")
 	rootCmd.Flags().StringVar(&token, "token", "", "token (required)")
+	rootCmd.Flags().IntVar(&limit, "limit", 1, "limit (option)")
 
 	rootCmd.MarkFlagRequired("server")
 	rootCmd.MarkFlagRequired("repo")
@@ -98,7 +95,7 @@ func main() {
 	}
 }
 
-func run() {
+func run(resty_client *resty.Client) {
 	log.Info().Msgf("Starting to upload to %s ", serverURL)
 
 	err := initDynamicClient()
@@ -106,7 +103,7 @@ func run() {
 		log.Fatal().Msgf("Failed to initialize dynamic client: %v", err)
 	}
 
-	err = uploadChart()
+	err = uploadChart(resty_client)
 	if err != nil {
 		log.Fatal().Msgf("Failed to upload chart: %v", err)
 	}
@@ -153,140 +150,90 @@ func initDynamicClient() (err error) {
 	return nil
 }
 
-func uploadChart() error {
-	u := fmt.Sprintf("%s/index.yaml", repoURL)
-	indexData, err := fetchIndex(u)
+func uploadChart(resty_client *resty.Client) error {
+	entry := &repo.Entry{
+		URL: repoURL,
+	}
+
+	chartRepo, err := repo.NewChartRepository(entry, getter.All(&cli.EnvSettings{}))
 	if err != nil {
-		log.Error().Msgf("Failed to fetch Helm index: %v", err)
-		return err
+		log.Fatal().Msgf("failed to create chart repo: %v", err)
+	}
+
+	indexPath, err := chartRepo.DownloadIndexFile()
+	if err != nil {
+		log.Fatal().Msgf("failed to download index file: %v", err)
+	}
+
+	indexData, err := repo.LoadIndexFile(indexPath)
+	if err != nil {
+		log.Fatal().Msgf("failed to load index file: %v", err)
 	}
 
 	for _, entries := range indexData.Entries {
-		var appID string
-		for idx, entry := range entries {
-			chartURL := entry.URLs[0]
-			chartData, err := fetchChart(chartURL)
+		appID := ""
+		success := 0
+
+		for _, entry := range entries {
+			if entry.Deprecated {
+				log.Warn().Msgf("App %s is deprecated, skip", entry.Name)
+				break
+			}
+
+			// download data
+			req := resty_client.R()
+			resp, err := req.Get(entry.URLs[0])
 			if err != nil {
-				log.Error().Msgf("Failed to fetch chart %s: %v", entry.Name, err)
+				log.Error().Msgf("Failed to fetch chart %v, %v", entry.Name, err)
 				continue
 			}
 
-			appRequest := AppRequest{
+			if resp.IsError() {
+				log.Error().Msgf("Failed to fetch chart %v, status code: %d", entry.Name, resp.StatusCode())
+				continue
+			}
+
+			// upload data
+			var url string
+			if appID == "" {
+				url = fmt.Sprintf("%s/kapis/application.kubesphere.io/v2/apps", serverURL)
+			} else {
+				url = fmt.Sprintf("%s/kapis/application.kubesphere.io/v2/apps/%s/versions", serverURL, appID)
+			}
+
+			var response struct {
+				AppName string `json:"appName"`
+			}
+			req = resty_client.R().SetBody(AppRequest{
 				RepoName:     "upload",
-				Package:      base64.StdEncoding.EncodeToString(chartData),
+				Package:      base64.StdEncoding.EncodeToString(resp.Body()),
 				CategoryName: mark,
 				Workspace:    "",
 				AppType:      "helm",
+			}).SetResult(&response)
+
+			resp, err = req.Post(url)
+			if err != nil {
+				log.Error().Msgf("Failed to post app version %s:%s %v", entry.Name, entry.Version, err)
+				continue
 			}
 
-			var url string
-			if idx == 0 {
-				url = fmt.Sprintf("%s/kapis/application.kubesphere.io/v2/apps", serverURL)
-				appID, err = upload(appRequest, entry.Name, entry.Version, url)
-				if err != nil {
-					log.Error().Msgf("Failed to post app %s: %v", entry.Name, err)
-					appID = "" // Reset appID to empty string on failure
-					continue
-				}
-			} else {
-				if appID == "" {
-					log.Error().Msgf("Skipping version %s for app %s due to missing appID", entry.Version, entry.Name)
-					continue
-				}
-				url = fmt.Sprintf("%s/kapis/application.kubesphere.io/v2/apps/%s/versions", serverURL, appID)
-				_, err = upload(appRequest, entry.Name, entry.Version, url)
-				if err != nil {
-					log.Error().Msgf("Failed to post app version %s:%s %v", entry.Name, entry.Version, err)
-					continue
-				}
+			if resp.IsError() {
+				log.Error().Msgf("failed to post app, status code: %d", resp.StatusCode())
+				continue
 			}
+
+			log.Info().Msgf("App %s:%s posted successfully", entry.Name, entry.Version)
+			success++
+			if success >= limit {
+				break
+			}
+
 			time.Sleep(200 * time.Millisecond)
 		}
 	}
 
 	return nil
-}
-
-func fetchIndex(url string) (*HelmIndex, error) {
-	resp, err := http.Get(url)
-	if err != nil {
-		log.Error().Msgf("Failed to fetch index: %v", err)
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Error().Msgf("Failed to read response body: %v", err)
-		return nil, err
-	}
-
-	var index HelmIndex
-	err = yaml.Unmarshal(body, &index)
-	if err != nil {
-		log.Error().Msgf("Failed to unmarshal index: %v", err)
-		return nil, err
-	}
-
-	return &index, nil
-}
-
-func fetchChart(url string) ([]byte, error) {
-	resp, err := http.Get(url)
-	if err != nil {
-		log.Error().Msgf("Failed to fetch chart: %v", err)
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Error().Msgf("Failed to read response body: %v", err)
-		return nil, err
-	}
-	return body, nil
-}
-
-func upload(appRequest AppRequest, name, version, url string) (appID string, err error) {
-	jsonData, _ := json.Marshal(appRequest)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		log.Error().Msgf("Failed to create request: %v", err)
-		return "", err
-	}
-
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Error().Msgf("Failed to send request: %v", err)
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		log.Fatal().Msgf("Failed to find app store manager, please check if it is installed")
-		return "", fmt.Errorf("please check if app store manager is installed")
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("failed to post app, status code: %d", resp.StatusCode)
-	}
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Error().Msgf("Failed to read response body: %v", err)
-		return "", err
-	}
-	var response struct {
-		AppName string `json:"appName"`
-	}
-	err = json.Unmarshal(body, &response)
-	if err != nil {
-		log.Error().Msgf("Failed to unmarshal response body:%s,  %v", string(body), err)
-		return "", err
-	}
-
-	log.Info().Msgf("App %s:%s posted successfully", name, version)
-	return response.AppName, nil
 }
 
 func updateVersionStatus(listOptions metav1.ListOptions) error {
